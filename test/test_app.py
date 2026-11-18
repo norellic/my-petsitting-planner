@@ -24,8 +24,8 @@ def button(at: AppTest, label: str):
 
 
 def add_pet(at: AppTest, name: str, species: str = "dog") -> None:
-    at.text_input[1].input(name)
-    at.text_input[2].input(species)
+    next(t for t in at.text_input if t.label == "Pet name").input(name)
+    next(t for t in at.text_input if t.label == "Species").input(species)
     button(at, "Add pet").click().run()
 
 
@@ -197,3 +197,38 @@ def test_filters_and_sort_change_what_the_list_shows():
     next(s for s in at.selectbox if s.key == "filter-pet").set_value("Mochi").run()
     assert len(task_rows(at)) == 1
     assert "Long walk" in task_rows(at)[0]
+
+
+def test_import_comes_first_then_manual_then_calendar_then_availability():
+    """The page reads: import notes, or add manually, calendar, or availability."""
+    at = new_app()
+
+    headings = [s.value for s in at.subheader]
+
+    assert headings[:4] == [
+        "Import the owner's notes",
+        "Or add pets manually",
+        "Upload your Google Calendar",
+        "Or add your general daily availability manually",
+    ]
+
+
+def test_calendar_upload_is_present_but_not_usable_yet():
+    at = new_app()
+
+    assert not at.exception
+    # AppTest has no file_uploader accessor in every version; the caption is the tell.
+    assert any("Coming soon" in c.value for c in at.caption)
+
+
+def test_the_ai_double_check_is_locked_until_there_is_availability():
+    at = new_app()
+    assert any(c.key == "import-review" and not c.disabled for c in at.checkbox)
+
+    # Remove every availability block.
+    while any(b.label == "Remove" and b.key and b.key.startswith("remove-") for b in at.button):
+        next(b for b in at.button if b.label == "Remove" and b.key.startswith("remove-")).click().run()
+
+    locked = [c for c in at.checkbox if c.key == "import-review-locked"]
+    assert locked and locked[0].disabled
+    assert not any(c.key == "import-review" for c in at.checkbox)

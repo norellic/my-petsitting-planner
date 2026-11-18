@@ -764,3 +764,88 @@ def test_a_pet_can_be_renamed_to_a_different_case_of_its_own_name():
     owner.update_pet(mochi, "Mochi", "dog")
 
     assert mochi.name == "Mochi"
+
+
+# --- spacing ------------------------------------------------------------------
+
+
+def spaced_task(pet, title, gap=180, group="bathroom breaks", **kwargs):
+    task = Task(
+        title, kwargs.pop("duration", 15), kwargs.pop("priority", "medium"),
+        min_gap_minutes=gap, spread_group=group, **kwargs,
+    )
+    pet.add_task(task)
+    return task
+
+
+def starts(plan):
+    return {entry.task.title: entry.start_time for entry in plan.scheduled_tasks}
+
+
+def test_spaced_tasks_are_not_placed_back_to_back_in_a_big_block():
+    george = Pet("George", "dog")
+    first = spaced_task(george, "Out 1", priority="high")
+    second = spaced_task(george, "Out 2")
+    plan = Scheduler().build_plan([first, second], [TimeBlock("day", "08:00", "14:00")])
+
+    assert starts(plan) == {"Out 1": "08:00", "Out 2": "11:00"}
+
+
+def test_three_spaced_breaks_cannot_all_fit_two_short_windows():
+    """The reported case: breaks used to be stacked one after another."""
+    george = Pet("George", "dog")
+    morning = spaced_task(george, "Morning out", priority="high", preferred_block="morning")
+    afternoon = spaced_task(george, "Afternoon out")
+    night = spaced_task(george, "Night out", priority="high", preferred_block="evening")
+    blocks = [TimeBlock("morning", "07:00", "09:00"), TimeBlock("evening", "17:30", "19:00")]
+
+    plan = Scheduler().build_plan([morning, afternoon, night], blocks)
+
+    assert starts(plan) == {"Morning out": "07:00", "Night out": "17:30"}
+    assert plan.dropped_tasks == [afternoon]
+    assert plan.spacing_dropped == [afternoon]  # it would have fitted, were it not for spacing
+    assert "couldn't keep 180 min" in plan.explain()
+
+
+def test_spacing_only_applies_within_the_same_pet_and_group():
+    george, wilson = Pet("George", "dog"), Pet("Wilson", "cat")
+    a = spaced_task(george, "Out", priority="high")
+    b = spaced_task(wilson, "Out", priority="high")  # different pet
+    c = spaced_task(george, "Walk", group="walks")  # different group
+    plan = Scheduler().build_plan([a, b, c], [TimeBlock("day", "08:00", "10:00")])
+
+    assert len(plan.scheduled_tasks) == 3
+    assert plan.spacing_dropped == []
+
+
+def test_unspaced_tasks_fill_the_gap_between_spaced_ones():
+    george = Pet("George", "dog")
+    first = spaced_task(george, "Out 1", priority="high")
+    second = spaced_task(george, "Out 2", priority="high")
+    filler = Task("Brush", 10, "low")
+    george.add_task(filler)
+
+    plan = Scheduler().build_plan([first, second, filler], [TimeBlock("day", "08:00", "12:00")])
+
+    assert starts(plan) == {"Out 1": "08:00", "Brush": "08:15", "Out 2": "11:00"}
+    assert plan.conflicts == []
+
+
+def test_a_full_day_is_not_blamed_on_spacing():
+    george = Pet("George", "dog")
+    big = spaced_task(george, "Walk", duration=60, gap=0)
+    plan = Scheduler().build_plan([big], [TimeBlock("short", "08:00", "08:30")])
+
+    assert plan.dropped_tasks == [big]
+    assert plan.spacing_dropped == []
+
+
+def test_spacing_survives_recurrence_and_rejects_negative_gaps():
+    george = Pet("George", "dog")
+    task = spaced_task(george, "Out", frequency="daily")
+
+    follow_up = task.next_occurrence()
+
+    assert (follow_up.min_gap_minutes, follow_up.spread_group) == (180, "bathroom breaks")
+    with pytest.raises(ValueError):
+        Task("Out", 10, "low", min_gap_minutes=-5)

@@ -48,7 +48,11 @@ def _format_hhmm(total_minutes: int) -> str:
 
 
 def _check_task_fields(
-    title: str, duration_minutes: int, priority: str, frequency: str = "once"
+    title: str,
+    duration_minutes: int,
+    priority: str,
+    frequency: str = "once",
+    min_gap_minutes: int = 0,
 ) -> None:
     """Raise ValueError if these aren't usable task details.
 
@@ -67,6 +71,8 @@ def _check_task_fields(
         raise ValueError(
             f"frequency must be one of {sorted(FREQUENCY_STEPS)}, got {frequency!r}"
         )
+    if min_gap_minutes < 0:
+        raise ValueError(f"min_gap_minutes cannot be negative, got {min_gap_minutes}")
 
 
 @dataclass
@@ -83,13 +89,23 @@ class Task:
     # The occurrence this one spawned when it was completed, so undoing the
     # completion can take it back again. Set by Pet.complete_task().
     spawned: Task | None = None
+    # Spacing: tasks of the same pet that share a spread_group (say "bathroom
+    # breaks") must start at least min_gap_minutes apart. 0 or no group means
+    # no spacing. Scheduler.build_plan() enforces it.
+    min_gap_minutes: int = 0
+    spread_group: str | None = None
 
     def __post_init__(self) -> None:
-        """Reject a blank title, unknown priority, duration, or frequency."""
+        """Reject a blank title, unknown priority, duration, frequency or gap."""
         _check_task_fields(
-            self.title, self.duration_minutes, self.priority, self.frequency
+            self.title,
+            self.duration_minutes,
+            self.priority,
+            self.frequency,
+            self.min_gap_minutes,
         )
         self.title = self.title.strip()
+        self.spread_group = (self.spread_group or "").strip() or None
 
     def mark_complete(self) -> None:
         """Mark this task done. Safe to call on an already-completed task."""
@@ -103,14 +119,27 @@ class Task:
         preferred_block: str | None = None,
         frequency: str = "once",
         due_date: date | None = None,
+        min_gap_minutes: int | None = None,
+        spread_group: str | None = None,
     ) -> None:
         """Change this task's details, applying the same checks as construction.
 
         Leaves completion status and the pet back-reference alone: editing what
         a task is doesn't change who it belongs to or whether it's done. A
-        due_date of None keeps the date the task already has.
+        due_date of None keeps the date the task already has, and so does a
+        min_gap_minutes / spread_group of None (spacing isn't edited in the UI).
         """
-        _check_task_fields(title, duration_minutes, priority, frequency)
+        _check_task_fields(
+            title,
+            duration_minutes,
+            priority,
+            frequency,
+            self.min_gap_minutes if min_gap_minutes is None else min_gap_minutes,
+        )
+        if min_gap_minutes is not None:
+            self.min_gap_minutes = min_gap_minutes
+        if spread_group is not None:
+            self.spread_group = spread_group.strip() or None
         self.title = title.strip()
         self.duration_minutes = duration_minutes
         self.priority = priority
@@ -142,6 +171,8 @@ class Task:
             preferred_block=self.preferred_block,
             frequency=self.frequency,
             due_date=self.due_date + step,
+            min_gap_minutes=self.min_gap_minutes,
+            spread_group=self.spread_group,
         )
 
 
@@ -449,6 +480,9 @@ class Plan:
     # Warnings about tasks that landed on top of each other. Normally empty:
     # see Scheduler.find_conflicts() for why it is kept anyway.
     conflicts: list[str] = field(default_factory=list)
+    # The dropped tasks that would have fitted if they hadn't had to keep their
+    # distance from the rest of their spread_group. A subset of dropped_tasks.
+    spacing_dropped: list[Task] = field(default_factory=list)
 
     def explain(self) -> str:
         """Describe what was scheduled, where, and why anything was left out."""
@@ -481,11 +515,17 @@ class Plan:
 
         if self.dropped_tasks:
             lines.append("")
-            lines.append("Dropped - no block had enough time left:")
+            lines.append("Dropped - no block had a suitable slot left:")
             for task in self.dropped_tasks:
+                why = ""
+                if any(task is spaced for spaced in self.spacing_dropped):
+                    why = (
+                        f", couldn't keep {task.min_gap_minutes} min from the other "
+                        f"{task.spread_group} tasks"
+                    )
                 lines.append(
                     f"  {task.title} ({_pet_name(task)}) "
-                    f"- needs {task.duration_minutes} min, {task.priority} priority"
+                    f"- needs {task.duration_minutes} min, {task.priority} priority{why}"
                 )
 
         return "\n".join(lines)
@@ -512,20 +552,28 @@ class Scheduler:
         """
         validate_time_blocks(time_blocks)
 
-        minutes_used = [0] * len(time_blocks)
+        occupied: list[list[tuple[int, int]]] = [[] for _ in time_blocks]
+        placed: list[tuple[Task, int]] = []  # every task placed so far, with its start
         scheduled: list[ScheduledTask] = []
         dropped: list[Task] = []
+        spacing_dropped: list[Task] = []
 
         for task in self.sort_tasks(tasks):
-            index = self._find_block(task, time_blocks, minutes_used)
-            if index is None:
+            slot = self._find_slot(task, time_blocks, occupied, placed)
+            if slot is None:
                 dropped.append(task)
+                # Would it have fitted if spacing hadn't been a rule? That is
+                # worth telling the owner apart from "no time left at all".
+                if self._find_slot(task, time_blocks, occupied, placed, spaced=False):
+                    spacing_dropped.append(task)
                 continue
 
-            block = time_blocks[index]
-            start = _parse_hhmm(block.start_time) + minutes_used[index]
-            scheduled.append(ScheduledTask(task, block.label, _format_hhmm(start)))
-            minutes_used[index] += task.duration_minutes
+            index, start = slot
+            scheduled.append(
+                ScheduledTask(task, time_blocks[index].label, _format_hhmm(start))
+            )
+            occupied[index].append((start, start + task.duration_minutes))
+            placed.append((task, start))
 
         # Tasks were placed in priority order; show them in clock order.
         in_order = self.sort_by_time(scheduled)
@@ -533,6 +581,7 @@ class Scheduler:
             scheduled_tasks=in_order,
             dropped_tasks=dropped,
             conflicts=self.find_conflicts(in_order),
+            spacing_dropped=spacing_dropped,
         )
 
     def find_conflicts(self, scheduled: list[ScheduledTask]) -> list[str]:
@@ -624,28 +673,80 @@ class Scheduler:
             key=lambda task: (-PRIORITY_ORDER[task.priority], task.duration_minutes),
         )
 
-    def _find_block(
-        self, task: Task, time_blocks: list[TimeBlock], minutes_used: list[int]
-    ) -> int | None:
-        """Index of the block this task should go in, or None if it fits nowhere.
+    def _find_slot(
+        self,
+        task: Task,
+        time_blocks: list[TimeBlock],
+        occupied: list[list[tuple[int, int]]],
+        placed: list[tuple[Task, int]],
+        spaced: bool = True,
+    ) -> tuple[int, int] | None:
+        """(block index, start in minutes) for this task, or None if it fits nowhere.
 
-        A task's preferred block wins when it still has room. Otherwise the task
-        falls back to the first block with room — preferred_block is a
-        preference, not a hard constraint.
+        A task's preferred block wins when it has a slot. Otherwise the task
+        falls back to the first block with one - preferred_block is a
+        preference, not a hard constraint. With spaced=False the spacing rule
+        is ignored, which is how a spacing drop is told from a full day.
         """
-
-        def has_room(index: int) -> bool:
-            """Whether the block at this index still has time for the task."""
-            remaining = time_blocks[index].duration_minutes() - minutes_used[index]
-            return remaining >= task.duration_minutes
-
+        order = list(range(len(time_blocks)))
         if task.preferred_block is not None:
-            for index, block in enumerate(time_blocks):
-                if block.label == task.preferred_block and has_room(index):
-                    return index
+            order.sort(key=lambda i: time_blocks[i].label != task.preferred_block)
 
-        for index in range(len(time_blocks)):
-            if has_room(index):
-                return index
+        neighbours = [
+            (other, start) for other, start in placed if spaced and self._same_group(task, other)
+        ]
+        for index in order:
+            start = self._earliest_start(task, time_blocks[index], occupied[index], neighbours)
+            if start is not None:
+                return index, start
+        return None
 
+    @staticmethod
+    def _same_group(task: Task, other: Task) -> bool:
+        """Whether the spacing rule applies between these two tasks.
+
+        Same pet, same non-empty spread_group (ignoring case), and at least one
+        of them asking for a gap.
+        """
+        return (
+            task.spread_group is not None
+            and other.spread_group is not None
+            and task.spread_group.lower() == other.spread_group.lower()
+            and task.pet is other.pet
+            and max(task.min_gap_minutes, other.min_gap_minutes) > 0
+        )
+
+    @staticmethod
+    def _earliest_start(
+        task: Task,
+        block: TimeBlock,
+        occupied: list[tuple[int, int]],
+        neighbours: list[tuple[Task, int]],
+    ) -> int | None:
+        """The earliest start in this block that overlaps nothing and keeps spacing.
+
+        The feasible starts form runs that begin at the block's start, the end
+        of a task already in it, or exactly a gap after a group neighbour, so
+        those are the only candidates worth trying. With no spacing involved
+        this reduces to "right after the last task", i.e. plain packing.
+        """
+        block_start = _parse_hhmm(block.start_time)
+        latest = _parse_hhmm(block.end_time) - task.duration_minutes
+        candidates = {block_start}
+        candidates.update(end for _, end in occupied)
+        for other, other_start in neighbours:
+            candidates.add(other_start + max(task.min_gap_minutes, other.min_gap_minutes))
+
+        for start in sorted(candidates):
+            if not block_start <= start <= latest:
+                continue
+            end = start + task.duration_minutes
+            if any(start < o_end and end > o_start for o_start, o_end in occupied):
+                continue
+            if any(
+                abs(start - other_start) < max(task.min_gap_minutes, other.min_gap_minutes)
+                for other, other_start in neighbours
+            ):
+                continue
+            return start
         return None

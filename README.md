@@ -462,3 +462,31 @@ Conflict detection
 
   back to back: 0 warning(s)
 ```
+
+## AI import: owner notes to tasks
+
+Paste (or upload a `.txt`/`.md` of) the care instructions an owner left, open **Import tasks from the owner's notes**, and click **Extract tasks**. The model proposes pets and tasks (duration, priority, repeats, preferred time of day); you review and edit them in a table, then add them. Scheduling is still done by `Scheduler`, not the model.
+
+Set a key before launching (or paste it into the box in the app; it's kept only in the session):
+
+```powershell
+$env:GEMINI_API_KEY = "..."       # Google Gemini (default model gemini-3.8-flash)
+$env:ANTHROPIC_API_KEY = "..."    # Claude (default model claude-haiku-5-5)
+streamlit run app.py
+```
+
+Override models with `GEMINI_MODEL` / `ANTHROPIC_MODEL`. Code lives in `ai_import.py`; tests in `test/test_ai_import.py` use a fake transport and never call the network.
+Or put GEMINI_API_KEY=... in a `.env` file next to app.py (it is gitignored).
+
+### AI double-check (agentic review)
+
+With availability entered, **Extract tasks** makes two Gemini calls (and no more):
+
+1. Extract tasks from the notes.
+2. The real `Scheduler` tries those tasks against your availability (no API call). The model then sees the notes, the tasks and what got dropped, and returns a corrected list. The scheduler runs again on the correction, and code decides whether to keep it: a revision that deletes tasks or fits worse is discarded. The page lists every change, worked out by code.
+
+The checkbox is locked until there is availability to grade against. Calendar (.ics) upload is a placeholder for now.
+
+### Spacing
+
+Tasks have two optional fields, `spread_group` and `min_gap_minutes`. Tasks of the same pet in the same group are kept at least that many minutes apart (start to start) by `Scheduler.build_plan`, so three bathroom breaks are spread through the day instead of stacked. If the availability has no slot far enough from the rest of the group, the task is dropped and the plan says it was spacing, not a full day, that did it. The AI import sets both fields from the notes; you can edit them in the review table.
